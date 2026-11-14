@@ -458,6 +458,53 @@ the prefix works as the selection
 for which objects should be automatically built and returned by ijson.
 
 
+Errors
+======
+
+All parsing errors derive from ``ijson.JSONError``.
+Python's standard ``json`` module raises ``json.JSONDecodeError``,
+which is *not* a subclass of ``JSONError``,
+so code that catches ``JSONError`` to isolate bad records
+will not catch it.
+
+``ijson.IncompleteJSONError`` (also a ``JSONError``)
+signals that the input ended before the document was complete.
+More data would make it valid,
+so it is the error to look for when retrying with a larger buffer.
+
+Invalid content that no additional data can fix
+is reported through the ``ijson.JSONLexicalError`` family,
+which is also a ``JSONError`` but deliberately *not* an
+``IncompleteJSONError``.
+It has one subclass per shape of malformed input:
+
+- ``ijson.InvalidControlCharacterError``:
+  a literal control character (``U+0000`` through ``U+001F``,
+  such as a bare newline or tab) inside a JSON string.
+- ``ijson.InvalidEscapeSequenceError``:
+  an invalid escape sequence, such as ``\q``
+  or a malformed ``\uXXXX`` escape.
+- ``ijson.InvalidUTF8Error``:
+  bytes that cannot be decoded as UTF-8.
+  A UTF-8 sequence cut short by the end of the input
+  is truncation, and still raises ``IncompleteJSONError``.
+
+Control character and escape sequence errors carry
+a ``position`` attribute with the character offset
+in the document where the offending construct starts
+(``None`` for ``InvalidUTF8Error``, since decoding happens
+before lexing and no document offset is available).
+The exception that first detected the problem
+is available via ``__cause__``.
+
+Other lexical errors, like invalid numbers,
+keep raising plain ``JSONError``.
+
+These distinctions are currently implemented by the ``python`` backend;
+the YAJL-based backends report all parse failures
+as ``JSONError`` (or ``IncompleteJSONError`` when input is exhausted).
+
+
 Backends
 ========
 
@@ -600,6 +647,11 @@ FAQ
    **A**: This error is caused by byte sequences that are not valid in UTF-8.
    In other words, the data given to ijson is not *really* UTF-8 encoded,
    or at least not properly.
+
+   The ``python`` backend reports invalid byte sequences as
+   ``InvalidUTF8Error`` (part of the ``JSONLexicalError`` family,
+   see errors_), while a sequence cut short by the end of the input
+   keeps raising ``IncompleteJSONError``.
 
    Depending on where the data comes from you have different options:
 

@@ -2,6 +2,12 @@
 
 ## Development
 
+* The `python` backend now reports malformed string and UTF-8 content through
+  the new `JSONLexicalError` family (still a `JSONError` subclass), instead of
+  letting `json.JSONDecodeError` escape or reporting invalid bytes as
+  truncation. `InvalidControlCharacterError`, `InvalidEscapeSequenceError`
+  and `InvalidUTF8Error` cover the three shapes; `IncompleteJSONError` keeps
+  being raised for genuinely truncated input.
 * Fixed handling of integers longer than `sys.get_int_max_str_digits()`:
   the `yajl2_c` backend no longer crashes on them, and all backends
   now raise the `ValueError` produced by `int()` (#188).

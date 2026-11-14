@@ -1,7 +1,7 @@
 '''
 Pure-python parsing backend.
 '''
-from json.decoder import scanstring
+from json.decoder import scanstring, JSONDecodeError
 import re
 
 from ijson import common, utils
@@ -19,6 +19,140 @@ class UnexpectedSymbol(common.JSONError):
         super(UnexpectedSymbol, self).__init__(
             'Unexpected symbol %r at %d' % (symbol, pos)
         )
+
+
+# Prefixes of the messages the standard library's string scanner uses. They are
+# matched as prefixes because the C and the Python implementations produce
+# different suffixes (and report ``JSONDecodeError.pos`` differently).
+_CONTROL_CHARACTER_MSG = 'Invalid control character'
+_INVALID_ESCAPE_MSG = 'Invalid \\escape'
+_INVALID_U_ESCAPE_MSG = 'Invalid \\uXXXX escape'
+_UNTERMINATED_STRING_MSG = 'Unterminated string'
+
+
+def _is_control_character(ch):
+    return ord(ch) < 0x20
+
+
+def _first_unescaped_control_character(s):
+    '''
+    Returns the index of the first control character in the string lexeme
+    ``s`` that is not part of an escape sequence, or ``None`` if there is none.
+
+    Escape sequences never contain literal control characters (they use
+    letters such as ``n``, ``t`` or ``u``), so skipping the character after a
+    backslash is enough to avoid false positives.
+    '''
+    index = 1
+    while index < len(s):
+        if s[index] == '\\':
+            index += 2
+            continue
+        if _is_control_character(s[index]):
+            return index
+        index += 1
+    return None
+
+
+def _relative_error_position(s, e):
+    '''
+    Returns the position, within ``s``, of the character that starts the
+    offending construct: the control character itself, or the backslash that
+    introduces an invalid escape sequence.
+
+    ``JSONDecodeError.pos`` does not have that meaning consistently: the C
+    implementation points at the offending character while the Python one
+    points at the character after it, and for escape sequences they disagree on
+    whether the backslash or the escaped character is reported. Normalizing
+    here keeps ``position`` stable across Python implementations.
+    '''
+    if e.msg.startswith(_CONTROL_CHARACTER_MSG):
+        position = _first_unescaped_control_character(s)
+        if position is not None:
+            return position
+    pos = e.pos
+    if pos < len(s) and s[pos] == '\\':
+        return pos
+    if pos > 0 and s[pos - 1] == '\\':
+        return pos - 1
+    return pos
+
+
+def _translate_scanstring_error(s, e, base=None):
+    '''
+    Maps a `json.JSONDecodeError` raised by `scanstring` onto ijson's error
+    family.
+
+    Genuine truncation (the scanner ran out of input) keeps the historical
+    `IncompleteJSONError` behavior; lexical errors that no additional input can
+    fix are raised as `JSONLexicalError` subclasses so callers can route them
+    to a quarantine area instead of treating them as truncated input.
+
+    ``base`` is the offset of ``s`` within the parsed document, so that
+    ``position`` and the message both refer to the document rather than to the
+    string lexeme. Messages are built here instead of reusing the standard
+    library's, whose line/column information is also relative to the lexeme and
+    therefore misleading once the error surfaces to ijson's caller.
+    '''
+    message = e.msg
+    if message.startswith(_UNTERMINATED_STRING_MSG):
+        return common.IncompleteJSONError(e)
+    relative = _relative_error_position(s, e)
+    position = None if base is None else base + relative
+    location = '' if position is None else ' at position %d' % (position,)
+    if message.startswith(_CONTROL_CHARACTER_MSG):
+        cls = common.InvalidControlCharacterError
+        char = s[relative] if relative < len(s) else None
+        detail = 'Invalid control character %r%s' % (char, location)
+    elif message.startswith((_INVALID_ESCAPE_MSG, _INVALID_U_ESCAPE_MSG)):
+        cls = common.InvalidEscapeSequenceError
+        escape = s[relative:relative + 2]
+        detail = 'Invalid escape sequence %r%s' % (escape, location)
+    else:
+        # Anything else scanstring reports is still invalid string content,
+        # never a truncation; keep it inside the lexical error family.
+        cls = common.JSONLexicalError
+        detail = 'Invalid string content%s' % (location,)
+    return cls(detail, position)
+
+
+def _is_truncated_utf8(e):
+    '''
+    True if ``e`` describes a UTF-8 sequence that is merely cut short by the
+    end of the input, as opposed to bytes that are not valid UTF-8 at all.
+
+    This is decided structurally (the offending bytes are at the end of the
+    input and are a valid incomplete sequence) instead of by matching the
+    decoder's message, which implementations are free to word differently.
+    '''
+    sequence = e.object[e.start:e.end]
+    if e.end != len(e.object):
+        return False
+    decoder = codecs.getincrementaldecoder('utf-8')()
+    try:
+        # An incomplete-but-valid prefix is buffered rather than rejected.
+        decoder.decode(sequence, False)
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def _translate_unicode_decode_error(e):
+    '''
+    Maps a `UnicodeDecodeError` raised by the incremental UTF-8 decoder onto
+    ijson's error family.
+
+    A sequence cut short at the end of the input is truncation and keeps being
+    reported as `IncompleteJSONError`. Bytes that cannot start or continue a
+    valid UTF-8 sequence will never decode, no matter what comes next, and are
+    reported as `InvalidUTF8Error`.
+
+    No document ``position`` can be reported: bytes are decoded before they are
+    lexed, and the decoder only sees the current read buffer.
+    '''
+    if _is_truncated_utf8(e):
+        return common.IncompleteJSONError(e)
+    return common.InvalidUTF8Error('Invalid UTF-8 byte sequence: %s' % (e.reason,))
 
 
 @utils.coroutine
@@ -40,7 +174,7 @@ def utf8_encoder(target):
                 target.close()
             except:
                 pass
-            raise common.IncompleteJSONError(e)
+            raise _translate_unicode_decode_error(e) from e
         except:
             try:
                 target.close()
@@ -193,7 +327,7 @@ def parse_value(target, multivalue, use_float):
                 send(('boolean', False))
                 pop()
             elif symbol[0] == '"':
-                send(('string', parse_string(symbol)))
+                send(('string', parse_string(symbol, pos)))
                 pop()
             # Array start
             elif symbol == '[':
@@ -253,7 +387,7 @@ def parse_value(target, multivalue, use_float):
         elif state == _PARSE_OBJECT_KEY:
             if symbol[0] != '"':
                 raise UnexpectedSymbol(symbol, pos)
-            send(('map_key', parse_string(symbol)))
+            send(('map_key', parse_string(symbol, pos)))
             pos, symbol = (yield)
             if (pos, symbol) == EOF:
                 raise common.IncompleteJSONError('Incomplete JSON content')
@@ -284,8 +418,17 @@ def parse_value(target, multivalue, use_float):
                 pop()
 
 
-def parse_string(symbol):
-    return scanstring(symbol, 1)[0]
+def parse_string(symbol, pos=None):
+    '''
+    Decodes a string lexeme (including its surrounding quotes).
+
+    Invalid string content raises a `common.JSONLexicalError` subclass;
+    truncated content keeps raising `common.IncompleteJSONError`.
+    '''
+    try:
+        return scanstring(symbol, 1)[0]
+    except JSONDecodeError as e:
+        raise _translate_scanstring_error(symbol, e, base=pos) from e
 
 
 def basic_parse_basecoro(target, multiple_values=False, allow_comments=False,

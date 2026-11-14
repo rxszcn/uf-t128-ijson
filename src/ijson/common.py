@@ -23,6 +23,60 @@ class IncompleteJSONError(JSONError):
     pass
 
 
+class JSONLexicalError(JSONError):
+    '''
+    Base exception for malformed input found while lexically scanning the
+    input.
+
+    These errors describe content that can never become valid JSON no matter
+    how much more data arrives. They are deliberately *not* subclasses of
+    `IncompleteJSONError`: treating invalid content as truncated input makes
+    consumers retry or wait for data that will never make the document valid.
+
+    Concrete subclasses cover the three shapes that can be reported:
+
+    - `InvalidControlCharacterError`: a literal control character
+      (U+0000 through U+001F) inside a string, which JSON requires to be
+      escaped.
+    - `InvalidEscapeSequenceError`: an escape sequence that is not valid JSON
+      (for example ``\\q``, or a malformed ``\\uXXXX`` escape).
+    - `InvalidUTF8Error`: a byte sequence that cannot be decoded as UTF-8.
+
+    ``position`` is the character offset in the parsed document where the
+    offending construct starts, or ``None`` when it cannot be determined (UTF-8
+    decoding happens before lexing, so no document offset is available). It
+    helps quarantining bad records. The lower-level exception that triggered
+    the error, when there is one, is available as ``__cause__``.
+    '''
+    def __init__(self, message, position=None):
+        super().__init__(message)
+        self.position = position
+
+
+class InvalidControlCharacterError(JSONLexicalError):
+    '''
+    Raised when a JSON string contains an unescaped control character.
+    '''
+    pass
+
+
+class InvalidEscapeSequenceError(JSONLexicalError):
+    '''
+    Raised when a JSON string contains an invalid escape sequence.
+    '''
+    pass
+
+
+class InvalidUTF8Error(JSONLexicalError):
+    '''
+    Raised when the input contains byte sequences that are not valid UTF-8.
+
+    A UTF-8 sequence cut short by the end of the input is truncation, not an
+    invalid byte sequence, and keeps raising `IncompleteJSONError`.
+    '''
+    pass
+
+
 @utils.coroutine
 def parse_basecoro(target):
     '''
